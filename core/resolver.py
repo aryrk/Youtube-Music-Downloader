@@ -76,13 +76,17 @@ def _base_opts(cookies_path: str | None = None) -> dict:
     opts: dict = {
         "quiet": True,
         "no_warnings": True,
-        "extractor_args": {
-            "youtube": {"player_client": ["web_music"]},
-        },
     }
     if cookies_path:
         opts["cookiefile"] = cookies_path
-        opts["extractor_args"]["youtubepot-bgutilhttp"] = {"base_url": [POT_URL]}
+        opts["extractor_args"] = {
+            "youtube": {"player_client": ["web_music", "tv"]},
+            "youtubepot-bgutilhttp": {"base_url": [POT_URL]},
+        }
+    else:
+        opts["extractor_args"] = {
+            "youtube": {"player_client": ["android", "ios", "tv", "web"]}
+        }
     return opts
 
 

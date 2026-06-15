@@ -22,9 +22,15 @@ RUN apt-get update -y && \
         xvfb \
         x11vnc \
         websockify \
+        wget \
+        gnupg \
+        unzip \
         && \
+    curl -fsSL https://deno.land/x/install/install.sh | sh && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
+
+ENV PATH="/root/.deno/bin:${PATH}"
 
 WORKDIR /app
 
@@ -52,4 +58,6 @@ RUN mkdir -p /app/downloads /app/data /app/temp_cookies
 
 EXPOSE 8000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+COPY start.sh /app/start.sh
+RUN chmod +x /app/start.sh
+CMD ["/app/start.sh"]

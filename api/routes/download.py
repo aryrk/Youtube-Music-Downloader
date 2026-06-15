@@ -8,9 +8,13 @@ Download management routes:
 from __future__ import annotations
 
 import uuid
+import os
+import tempfile
+import zipfile
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse
 
 from core import job_queue
 from core.job_queue import Job
@@ -101,3 +105,64 @@ async def retry_job(job_id: str):
             detail="Job not found or not in a retryable state",
         )
     return {"job_id": new_job.id}
+
+
+@router.get("/file/{job_id}")
+async def download_file(job_id: str):
+    job = job_queue.get_job(job_id)
+    if not job or job.status != "done" or not job.output_path:
+        raise HTTPException(status_code=404, detail="File not ready or job not found")
+    
+    path = Path(job.output_path)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="File deleted from server")
+    
+    return FileResponse(
+        path=path,
+        filename=path.name,
+        media_type="application/octet-stream",
+        content_disposition_type="attachment"
+    )
+
+
+@router.get("/zip")
+async def download_zip(job_ids: str, background_tasks: BackgroundTasks):
+    ids = [j.strip() for j in job_ids.split(",") if j.strip()]
+    if not ids:
+        raise HTTPException(status_code=400, detail="No job IDs provided")
+    
+    files_to_zip = []
+    for jid in ids:
+        job = job_queue.get_job(jid)
+        if job and job.status == "done" and job.output_path:
+            p = Path(job.output_path)
+            if p.exists():
+                files_to_zip.append(p)
+                
+    if not files_to_zip:
+        raise HTTPException(status_code=404, detail="No completed files found for requested jobs")
+        
+    fd, temp_path = tempfile.mkstemp(suffix=".zip", prefix="ytm_")
+    os.close(fd)
+    
+    try:
+        with zipfile.ZipFile(temp_path, "w", zipfile.ZIP_STORED) as zf:
+            for p in files_to_zip:
+                zf.write(p, arcname=p.name)
+    except Exception as e:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise HTTPException(status_code=500, detail=f"Failed to create zip: {e}")
+        
+    def cleanup():
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+            
+    background_tasks.add_task(cleanup)
+    
+    return FileResponse(
+        path=temp_path,
+        filename="ytm_download.zip",
+        media_type="application/zip",
+        content_disposition_type="attachment"
+    )

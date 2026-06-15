@@ -71,38 +71,30 @@ async def download_job(job: Job) -> None:
     has_premium = bool(cookies_path and Path(cookies_path).exists())
 
     # Format selection
-    # Premium (itag 141 = 256kbps AAC) vs free (itag 140 = 128kbps AAC)
-    if has_premium:
-        fmt_sel = "bestaudio[format_id=141]/bestaudio[ext=m4a]/bestaudio/best"
-    else:
-        # itag 140 is freely available via android client without JS challenge
-        fmt_sel = "bestaudio[format_id=140]/bestaudio[ext=m4a]/bestaudio/best"
+    fmt_sel = "bestaudio[ext=m4a]/bestaudio/best"
 
     # Output template
     if folder_mode == "by_album":
-        outtmpl = (
-            f"{OUTPUT_DIR}"
-            "/%(album_artist|%(uploader|%(channel)s)s)s"
-            "/%(album|%(playlist_title|Singles)s)s"
-            "/%(track_number|00)02d %(title)s.%(ext)s"
-        )
+        outtmpl = f"{OUTPUT_DIR}/%(album_artist,artist,uploader|Unknown)s/%(album,playlist_title|Singles)s/%(track_number,playlist_index|0)02d %(title)s.%(ext)s"
     else:
-        outtmpl = (
-            f"{OUTPUT_DIR}"
-            "/%(album_artist|%(uploader|%(channel)s)s)s"
-            " - %(track_number|00)02d %(title)s.%(ext)s"
-        )
+        outtmpl = f"{OUTPUT_DIR}/%(album_artist,artist,uploader|Unknown)s - %(track_number,playlist_index|0)02d %(title)s.%(ext)s"
 
     # Postprocessors
     postprocessors: list[dict] = []
 
+    PREFERRED_QUALITY = {
+        "quality": {"mp3": "0", "ogg": "0", "opus": "0", "flac": "0", "wav": "0", "m4a": "0"},
+        "size":    {"mp3": "192", "ogg": "5", "opus": "0", "flac": "5", "wav": "0", "m4a": "0"},
+    }
+
+    preferred_quality = PREFERRED_QUALITY.get(quality_mode, {}).get(target_format, "0")
+
     if target_format != "m4a":
-        ffmpeg_args = FFMPEG_ARGS.get(quality_mode, {}).get(target_format, [])
         postprocessors.append(
             {
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": target_format,
-                "preferredquality": "0",
+                "preferredquality": preferred_quality,
             }
         )
 
@@ -113,27 +105,9 @@ async def download_job(job: Job) -> None:
         ]
     )
 
-    # Postprocessor args for quality control
-    pp_args: dict = {}
-    if target_format != "m4a":
-        ffmpeg_args = FFMPEG_ARGS.get(quality_mode, {}).get(target_format, [])
-        if ffmpeg_args:
-            pp_args["FFmpegExtractAudio"] = ffmpeg_args
-
-    # Thumbnail crop square
-    pp_args["thumbnails"] = ["-vf", "crop='min(iw,ih)':'min(iw,ih)'"]
-
-    # extractor_args: use android/mweb for free (no JS challenge), web_music+POT for premium
-    if has_premium:
-        extractor_args = {
-            "youtube": {"player_client": ["web_music"]},
-            "youtubepot-bgutilhttp": {"base_url": [POT_URL]},
-        }
-    else:
-        # android and mweb clients return signed URLs that don't need JS decryption
-        extractor_args = {
-            "youtube": {"player_client": ["android", "mweb"]},
-        }
+    pp_args: dict = {
+        "thumbnails": ["-vf", "crop='min(iw,ih)':'min(iw,ih)'"],
+    }
 
     ydl_opts: dict = {
         "format": fmt_sel,
@@ -144,11 +118,18 @@ async def download_job(job: Job) -> None:
         "progress_hooks": [make_progress_hook(job)],
         "postprocessors": postprocessors,
         "postprocessor_args": pp_args,
-        "extractor_args": extractor_args,
     }
 
     if cookies_path and Path(cookies_path).exists():
         ydl_opts["cookiefile"] = cookies_path
+        ydl_opts["extractor_args"] = {
+            "youtube": {"player_client": ["web_music", "tv"]},
+            "youtubepot-bgutilhttp": {"base_url": [POT_URL]},
+        }
+    else:
+        ydl_opts["extractor_args"] = {
+            "youtube": {"player_client": ["android", "ios", "tv", "web"]}
+        }
 
     # Build URL
     video_url = f"https://music.youtube.com/watch?v={job.video_id}"
@@ -190,14 +171,6 @@ async def download_job(job: Job) -> None:
         await persist_job(job)
         return
 
-    # Post-processing: fix MP3 cover art if needed
-    if target_format == "mp3" and output_file:
-        mp3_path = Path(output_file[0])
-        # Look for the source m4a (yt-dlp keeps it temporarily)
-        m4a_candidate = mp3_path.with_suffix(".m4a")
-        if m4a_candidate.exists():
-            meta_module.fix_mp3_cover(m4a_candidate, mp3_path)
-
     # Update job to done
     job.status = "done"
     job.progress = 100.0
@@ -209,15 +182,3 @@ async def download_job(job: Job) -> None:
 
     await broadcast(job)
     await persist_job(job)
-
-    # Schedule cookie cleanup (30 min TTL)
-    if cookies_path:
-        asyncio.ensure_future(_delete_after_delay(cookies_path, 1800))
-
-
-async def _delete_after_delay(path: str, delay: float) -> None:
-    await asyncio.sleep(delay)
-    try:
-        Path(path).unlink(missing_ok=True)
-    except Exception:
-        pass

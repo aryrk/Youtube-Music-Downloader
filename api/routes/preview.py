@@ -45,13 +45,17 @@ async def _get_stream_url(video_id: str, cookies_path: str | None) -> str:
         "format": "bestaudio[ext=m4a]/bestaudio/best",
         "quiet": True,
         "no_warnings": True,
-        "extractor_args": {
-            "youtube": {"player_client": ["web_music"]},
-            "youtubepot-bgutilhttp": {"base_url": [POT_URL]},
-        },
     }
     if cookies_path:
         opts["cookiefile"] = cookies_path
+        opts["extractor_args"] = {
+            "youtube": {"player_client": ["web_music", "tv"]},
+            "youtubepot-bgutilhttp": {"base_url": [POT_URL]},
+        }
+    else:
+        opts["extractor_args"] = {
+            "youtube": {"player_client": ["android", "ios", "tv", "web"]}
+        }
 
     loop = asyncio.get_event_loop()
 

@@ -38,11 +38,32 @@ async def lifespan(app: FastAPI):
     # Restore jobs from DB
     await job_queue.restore_jobs_from_db()
 
+    import asyncio as _asyncio
+    _asyncio.ensure_future(_cookie_cleanup_task())
+
     logger.info("Backend ready.")
     yield
 
     logger.info("Shutting down...")
     await close_db()
+
+
+async def _cookie_cleanup_task() -> None:
+    """Delete cookie files older than 30 minutes every 5 minutes."""
+    import time
+    from pathlib import Path
+    cookie_dir = Path("/app/temp_cookies")
+    while True:
+        import asyncio
+        await asyncio.sleep(300)
+        cutoff = time.time() - 1800
+        for f in cookie_dir.glob("*.txt"):
+            try:
+                if f.stat().st_mtime < cutoff:
+                    f.unlink(missing_ok=True)
+                    logger.info("Expired cookies removed: %s", f.name)
+            except Exception:
+                pass
 
 
 app = FastAPI(

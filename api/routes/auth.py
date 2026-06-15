@@ -1,18 +1,18 @@
 """
-Playwright-based Google authentication routes.
-Provides an in-browser login flow via noVNC.
+Playwright-based Google authentication via a persistent virtual display.
+Xvfb + x11vnc + websockify start at container launch (not per-session).
+The noVNC viewer at port 6080 is exposed in docker-compose.
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
 from schemas.models import AuthStartResponse, AuthStatusResponse
 
@@ -22,129 +22,140 @@ router = APIRouter()
 TEMP_DIR = Path("/app/temp_cookies")
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
-# In-memory auth sessions: session_id → {browser, context, status, display, vnc_proc}
-_auth_sessions: dict[str, dict] = {}
+_sessions: dict[str, dict] = {}
 
-VNC_BASE_PORT = 5900
-NOVNC_BASE_PORT = 6080
+_playwright_obj = None
+_browser = None
+_browser_lock = asyncio.Lock()
 
 
-def _next_display() -> int:
-    """Find an available X display number."""
-    used = {s.get("display", 99) for s in _auth_sessions.values()}
-    for i in range(1, 20):
-        if i not in used:
-            return i
-    return 1
+async def _ensure_browser():
+    """Lazily start a single Playwright Chromium instance on the virtual display."""
+    global _playwright_obj, _browser
+    async with _browser_lock:
+        if _browser and _browser.is_connected():
+            return _browser
+        try:
+            from playwright.async_api import async_playwright
+            if _playwright_obj:
+                try:
+                    await _playwright_obj.stop()
+                except Exception:
+                    pass
+            _playwright_obj = await async_playwright().start()
+            env = {**os.environ, "DISPLAY": ":99"}
+            _browser = await _playwright_obj.chromium.launch(
+                headless=False,
+                env=env,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-infobars",
+                    "--disable-background-timer-throttling",
+                    "--disable-backgrounding-occluded-windows",
+                    "--disable-renderer-backgrounding",
+                    "--window-size=1280,800",
+                    "--start-maximized",
+                ],
+            )
+            logger.info("Playwright Chromium launched on DISPLAY=:99")
+            return _browser
+        except Exception as exc:
+            logger.error("Failed to launch Playwright browser: %s", exc)
+            raise
 
 
 @router.post("/auth/start", response_model=AuthStartResponse)
-async def auth_start():
-    """Launch a Playwright Chromium browser and expose it via noVNC."""
+async def auth_start(request: Request):
+    """
+    Open a Google sign-in page in the shared Chromium instance.
+    The user watches and interacts via the noVNC viewer at port 6080.
+    """
+    session_id = str(uuid.uuid4())
+    _sessions[session_id] = {"status": "starting", "context": None, "cookie_path": None}
+
     try:
-        from playwright.async_api import async_playwright
-    except ImportError:
-        raise HTTPException(
-            status_code=503,
-            detail="Playwright not installed. Rebuild Docker image with Playwright support.",
+        browser = await _ensure_browser()
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 800},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            ),
+            java_script_enabled=True,
+            accept_downloads=False,
         )
 
-    session_id = str(uuid.uuid4())
-    display_num = _next_display()
-    display = f":{display_num}"
-    vnc_port = VNC_BASE_PORT + display_num
-    novnc_port = NOVNC_BASE_PORT + display_num
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            window.chrome = {
+                app: { isInstalled: false },
+                runtime: {
+                    onMessage: { addListener: () => {} },
+                    connect: () => {}
+                }
+            };
+        """)
+        page = await context.new_page()
+        await page.goto("https://accounts.google.com/signin", wait_until="domcontentloaded")
+        _sessions[session_id]["context"] = context
+        _sessions[session_id]["status"] = "pending"
+    except Exception as exc:
+        _sessions[session_id]["status"] = "error"
+        _sessions[session_id]["error"] = str(exc)
+        logger.error("Auth start failed: %s", exc)
+        raise HTTPException(status_code=503, detail=f"Could not launch browser: {exc}")
 
-    # Start Xvfb
-    xvfb_proc = await asyncio.create_subprocess_exec(
-        "Xvfb", display, "-screen", "0", "1280x800x24",
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    await asyncio.sleep(1)
-
-    # Start x11vnc
-    vnc_proc = await asyncio.create_subprocess_exec(
-        "x11vnc", "-display", display, "-nopw", "-listen", "localhost",
-        "-xkb", "-forever", "-port", str(vnc_port),
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    await asyncio.sleep(0.5)
-
-    # Start websockify (noVNC proxy)
-    novnc_proc = await asyncio.create_subprocess_exec(
-        "websockify", "--web", "/app/novnc", str(novnc_port),
-        f"localhost:{vnc_port}",
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    await asyncio.sleep(0.5)
-
-    # Launch Playwright with the virtual display
-    env = {**os.environ, "DISPLAY": display}
-    playwright_obj = await async_playwright().start()
-    browser = await playwright_obj.chromium.launch(
-        headless=False,
-        env=env,
-        args=["--no-sandbox", "--disable-gpu"],
-    )
-    context = await browser.new_context()
-    page = await context.new_page()
-    await page.goto("https://accounts.google.com/signin")
-
-    _auth_sessions[session_id] = {
-        "playwright": playwright_obj,
-        "browser": browser,
-        "context": context,
-        "status": "pending",
-        "display": display_num,
-        "xvfb_proc": xvfb_proc,
-        "vnc_proc": vnc_proc,
-        "novnc_proc": novnc_proc,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-    vnc_url = f"/novnc/vnc.html?host={{}}&port={novnc_port}&autoconnect=true"
-    return AuthStartResponse(session_id=session_id, vnc_url=f"/novnc/?port={novnc_port}")
+    host = request.headers.get("host", "localhost").split(":")[0]
+    vnc_url = f"http://{host}:6080/vnc.html?autoconnect=true&resize=scale&quality=6"
+    return AuthStartResponse(session_id=session_id, vnc_url=vnc_url)
 
 
 @router.get("/auth/status/{session_id}", response_model=AuthStatusResponse)
 async def auth_status(session_id: str):
-    """Check whether the user has completed Google login."""
-    session = _auth_sessions.get(session_id)
+    """Poll to detect when the user has completed sign-in."""
+    session = _sessions.get(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    if session["status"] == "authenticated":
-        return AuthStatusResponse(status="authenticated", session=session_id)
+    if session["status"] in ("authenticated", "error"):
+        return AuthStatusResponse(
+            status=session["status"],
+            session=session_id if session["status"] == "authenticated" else None,
+        )
 
-    # Check for SAPISID cookie
+    context = session.get("context")
+    if not context:
+        return AuthStatusResponse(status=session["status"])
+
     try:
-        context = session["context"]
         cookies = await context.cookies(["https://music.youtube.com"])
-        has_auth = any(c["name"] == "SAPISID" for c in cookies)
-        if has_auth:
+        if any(c["name"] == "SAPISID" for c in cookies):
             session["status"] = "authenticated"
             return AuthStatusResponse(status="authenticated", session=session_id)
-    except Exception as e:
-        logger.warning("Auth status check failed: %s", e)
+    except Exception as exc:
+        logger.warning("Cookie check failed: %s", exc)
 
     return AuthStatusResponse(status="pending")
 
 
 @router.post("/auth/complete/{session_id}")
 async def auth_complete(session_id: str):
-    """Export cookies from the Playwright session and save to file."""
-    session = _auth_sessions.get(session_id)
+    """Export cookies from the Playwright context and persist to disk."""
+    session = _sessions.get(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    try:
-        context = session["context"]
-        cookies = await context.cookies()
+    context = session.get("context")
+    if not context:
+        raise HTTPException(status_code=400, detail="No browser context for this session")
 
-        # Write Netscape cookie file format
+    try:
+        cookies = await context.cookies()
         cookie_path = TEMP_DIR / f"{session_id}.txt"
         with open(cookie_path, "w") as f:
             f.write("# Netscape HTTP Cookie File\n")
@@ -160,6 +171,12 @@ async def auth_complete(session_id: str):
 
         session["status"] = "authenticated"
         session["cookie_path"] = str(cookie_path)
+
+        try:
+            await context.close()
+        except Exception:
+            pass
+
         return {"status": "ok", "session_id": session_id}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -167,27 +184,29 @@ async def auth_complete(session_id: str):
 
 @router.delete("/auth/session/{session_id}")
 async def auth_revoke(session_id: str):
-    """Close the browser session and delete cookies."""
-    session = _auth_sessions.pop(session_id, None)
+    """Close the browser context and delete stored cookies."""
+    session = _sessions.pop(session_id, None)
     if not session:
         return {"status": "not_found"}
 
-    try:
-        await session["browser"].close()
-        await session["playwright"].stop()
-    except Exception:
-        pass
-
-    for proc_key in ("novnc_proc", "vnc_proc", "xvfb_proc"):
-        proc = session.get(proc_key)
-        if proc:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
+    context = session.get("context")
+    if context:
+        try:
+            await context.close()
+        except Exception:
+            pass
 
     cookie_path = session.get("cookie_path")
     if cookie_path:
         Path(cookie_path).unlink(missing_ok=True)
 
     return {"status": "revoked"}
+
+
+@router.get("/auth/sessions")
+async def list_sessions():
+    """Return active auth sessions (for the frontend to check connection status)."""
+    return [
+        {"session_id": sid, "status": s["status"], "has_cookies": bool(s.get("cookie_path"))}
+        for sid, s in _sessions.items()
+    ]
