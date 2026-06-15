@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+python-multipart
+yt-dlp[default]
+ytmusicapi
+mutagen
+aiosqlite
+httpx
+bgutil-ytdlp-pot-provider
+playwright
